@@ -1,83 +1,159 @@
-//SPDX-License-Identifier:MIT
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
 
-pragma solidity ^0.8.23;
+// Custom errors
+error NotOwner(address caller);
+error EmptyTransaction();
+error InvalidAmount();
+error StakeEmpty();
+error TransactionFailed();
+error InsufficientETHRewards();
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 contract Staking {
 
-    uint256 Token_storage;
-    uint256 ETH_storage;
-    address public owner;
+    uint256 public totalStaked;
+    address public immutable owner;
+    IERC20 public immutable stakingToken;
 
-    IERC20 public stakingToken;
+    // reward rate: 1 token per second per staked token
+    uint256 public constant REWARD_RATE = 1;
 
     constructor(address _tokenAddress) {
+        if(_tokenAddress == address(0)) revert InvalidAmount();
         owner = msg.sender;
         stakingToken = IERC20(_tokenAddress);
     }
 
-    struct details{
-        uint256 Total_Stake;
-        uint256 Time_Deposited;
-        uint256 Total_Rewards;
-    } 
-    mapping(address => details) Stakers;
+    struct StakeDetails {
+        uint256 totalStake;
+        uint256 timeDeposited;
+        uint256 pendingRewards;
+    }
+    mapping(address => StakeDetails) private stakers;
 
-    modifier checkStake() {
-        require(Stakers[msg.sender].Total_Stake > 0, "Your stake is empty");
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    event ETHDeposited(address indexed owner, uint256 amount);
+
+    modifier onlyOwner() {
+        if(msg.sender != owner) revert NotOwner(msg.sender);
         _;
     }
 
-    function deposit()public payable{
-        require(msg.sender == owner, "You are not Authorized");
-        require(msg.value > 0, "Empty Transaction");
-        ETH_storage += msg.value;
+    modifier hasStake() {
+        if(stakers[msg.sender].totalStake == 0) revert StakeEmpty();
+        _;
+    }
+
+    // owner deposits ETH to fund rewards
+    function depositETH() public payable onlyOwner {
+        if(msg.value == 0) revert EmptyTransaction();
+        emit ETHDeposited(msg.sender, msg.value);
     }
 
     function stake(uint256 amount) public {
-        require(amount > 0, "Amount needs to be something");
-        uint256 _stake = Stakers[msg.sender].Total_Stake;
-        uint256 current_time = block.timestamp;
-        if(_stake > 0) {
-            Stakers[msg.sender].Total_Rewards =  CalculateRewards(Stakers[msg.sender].Total_Rewards, Stakers[msg.sender].Time_Deposited, _stake);
-            Stakers[msg.sender].Time_Deposited = current_time;
-        } else {
-            Stakers[msg.sender].Time_Deposited = current_time;
+        if(amount == 0) revert InvalidAmount();
+
+        uint256 currentStake = stakers[msg.sender].totalStake;
+
+        // save pending rewards before updating stake
+        if(currentStake > 0) {
+            stakers[msg.sender].pendingRewards = _calculateRewards(
+                stakers[msg.sender].pendingRewards,
+                stakers[msg.sender].timeDeposited,
+                currentStake
+            );
         }
-        Token_storage += amount;
-        Stakers[msg.sender].Total_Stake += amount;
+
+        stakers[msg.sender].timeDeposited = block.timestamp;
+        stakers[msg.sender].totalStake += amount;
+        totalStaked += amount;
+
+        // interactions last — reentrancy protection
         stakingToken.transferFrom(msg.sender, address(this), amount);
-    }
-    
 
-    function unstake(uint256 amount) public checkStake() {
-        uint256 _stake = Stakers[msg.sender].Total_Stake;
-        Stakers[msg.sender].Total_Rewards = CalculateRewards(Stakers[msg.sender].Total_Rewards, Stakers[msg.sender].Time_Deposited, _stake);
-        if(_stake == amount){
-            Stakers[msg.sender].Time_Deposited = 0;
-        } else {
-            Stakers[msg.sender].Time_Deposited = block.timestamp;
-        }
-        Stakers[msg.sender].Total_Stake -= amount;
-        Token_storage -= amount;
+        emit Staked(msg.sender, amount);
+    }
+
+    function unstake(uint256 amount) public hasStake {
+        if(amount == 0) revert InvalidAmount();
+        uint256 currentStake = stakers[msg.sender].totalStake;
+        if(amount > currentStake) revert InvalidAmount();
+
+        // save pending rewards before updating stake
+        stakers[msg.sender].pendingRewards = _calculateRewards(
+            stakers[msg.sender].pendingRewards,
+            stakers[msg.sender].timeDeposited,
+            currentStake
+        );
+
+        // reset timer if fully unstaking
+        stakers[msg.sender].timeDeposited = currentStake == amount ? 0 : block.timestamp;
+        stakers[msg.sender].totalStake -= amount;
+        totalStaked -= amount;
+
+        // interactions last — reentrancy protection
         stakingToken.transfer(msg.sender, amount);
+
+        emit Unstaked(msg.sender, amount);
     }
 
-    function claimRewards() public checkStake() {
-        uint256 rewards = CalculateRewards(Stakers[msg.sender].Total_Rewards, Stakers[msg.sender].Time_Deposited, Stakers[msg.sender].Total_Stake);
-        Stakers[msg.sender].Total_Rewards = 0;
-        ETH_storage -= rewards;
-        Stakers[msg.sender].Time_Deposited = block.timestamp;
-        (bool success, ) = (msg.sender).call{value:rewards}("");
-        require(success, "Transaction Failed");
+    function claimRewards() public hasStake {
+        uint256 rewards = _calculateRewards(
+            stakers[msg.sender].pendingRewards,
+            stakers[msg.sender].timeDeposited,
+            stakers[msg.sender].totalStake
+        );
+
+        if(rewards == 0) revert InvalidAmount();
+        if(address(this).balance < rewards) revert InsufficientETHRewards();
+
+        // update state before external call — reentrancy protection
+        stakers[msg.sender].pendingRewards = 0;
+        stakers[msg.sender].timeDeposited = block.timestamp;
+
+        (bool success, ) = msg.sender.call{value: rewards}("");
+        if(!success) revert TransactionFailed();
+
+        emit RewardsClaimed(msg.sender, rewards);
     }
 
-    function CalculateRewards(uint256 current, uint256 time, uint256 _stake) internal view returns(uint256) {
-        return current + ((block.timestamp - time) * _stake);
+    // view functions
+    function getStake(address user) public view returns (uint256) {
+        return stakers[user].totalStake;
     }
 
+    function getPendingRewards(address user) public view returns (uint256) {
+        return _calculateRewards(
+            stakers[user].pendingRewards,
+            stakers[user].timeDeposited,
+            stakers[user].totalStake
+        );
+    }
+
+    function getContractETHBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function getContractTokenBalance() public view returns (uint256) {
+        return stakingToken.balanceOf(address(this));
+    }
+
+    function _calculateRewards(
+        uint256 pending,
+        uint256 timeDeposited,
+        uint256 stakedAmount
+    ) internal view returns (uint256) {
+        if(timeDeposited == 0 || stakedAmount == 0) return pending;
+        return pending + ((block.timestamp - timeDeposited) * stakedAmount * REWARD_RATE);
+    }
+
+    receive() external payable {}
 }
